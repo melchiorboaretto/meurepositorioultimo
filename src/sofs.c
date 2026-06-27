@@ -28,6 +28,28 @@ static int g_mounted = false;
 static struct sofs_superbloco g_superbloco;
 static unsigned int g_superbloco_sector;   /* setor absoluto do superbloco */
 
+/* Tabela de Arquivos Abertos (Capacidade para 256 arquivos abertos simultaneamente) */
+#define MAX_OPEN_FILES 256
+struct open_file_entry {
+    int in_use;             /* 0 se livre, 1 se ocupado */
+    unsigned int inode_num; /* Índice do i-node referenciado */
+    unsigned int offset;    /* Ponteiro de posição corrente (bytes) */
+};
+static struct open_file_entry g_open_files[MAX_OPEN_FILES];
+
+/* Controle iterador para o diretório raiz */
+static unsigned int g_dir_offset = 0;
+
+/* --- Protótipos das funções auxiliares adicionais --- */
+static int read_inode(unsigned int inode_num, struct sofs_inode *inode);
+static int write_inode(unsigned int inode_num, struct sofs_inode *inode);
+static int get_block_from_inode(struct sofs_inode *inode, unsigned int logical_block);
+static int allocate_block_for_inode(struct sofs_inode *inode, unsigned int logical_block);
+static void free_inode_blocks(struct sofs_inode *inode);
+static int find_dir_entry(const char *name, struct sofs_record *out_rec, unsigned int *out_offset);
+static int add_dir_entry(const char *name, unsigned int inode_num, BYTE typeVal);
+static int remove_dir_entry(unsigned int offset);
+
 /* -------------------------------------------------------------------------
  * Auxiliar: lê o MBR e localiza a partição <partition>.
  * Preenche *first_sector e *num_sectors.
@@ -208,7 +230,7 @@ static int free_inode(unsigned int inode_num)
 
 int sofs_identify(char *name, int size)
 {
-    const char *id = "TODO implementation";
+    const char *id = "Grupo M";
     if (name == NULL || size <= 0)
         return -1;
     strncpy(name, id, size - 1);
@@ -269,7 +291,28 @@ int sofs_format(int partition, int sectors_per_block)
     if (write_block(0, block_buf) != 0)
         return -1;
 
-    /* TODO: inicializar com zeros as áreas de bitmap e de i-nodes */
+    /* Inicializar com zeros as áreas de bitmap e de i-nodes */
+    /* Inicializa fisicamente as áreas de bitmaps e i-nodes gravando zeros absolutos */
+    unsigned int total_bitmap_blocks = bitmap_blocks_data + bitmap_blocks_inode;
+    unsigned int total_blocks_to_zero = total_bitmap_blocks + inode_area_blocks;
+    unsigned char zero_buf[sectors_per_block * SECTOR_SIZE];
+    memset(zero_buf, 0, sizeof(zero_buf));
+
+    for (unsigned int i = 1; i <= total_blocks_to_zero; i++) {
+        if (write_block(i, zero_buf) != 0)
+            return -1;
+    }
+
+    /* Montagem Virtual Temporária: Necessária para alocar e fixar o Inode 0 como Diretório Raiz. */
+    sofs_mount(partition);
+    int root_inode = alloc_inode(); 
+    if (root_inode == 0) {
+        struct sofs_inode ri;
+        memset(&ri, 0, sizeof(ri));
+        ri.RefCounter = 1;
+        write_inode(0, &ri); /* Salva a inicialização do diretório no disco */
+    }
+    sofs_umount();
 
     return 0;
 }
@@ -324,107 +367,410 @@ int sofs_umount(void)
 }
 
 /* -------------------------------------------------------------------------
- * Operações de arquivo (TODO)
+ * Operações de arquivo
  * ---------------------------------------------------------------------- */
 
 SOFS_FILE sofs_create(char *filename)
 {
-    /* TODO: aloca um i-node (alloc_inode), adiciona um registro de diretório,
+    /* Aloca um i-node (alloc_inode), adiciona um registro de diretório,
      * abre o arquivo e retorna um handle. Se o arquivo já existir,
      * trunca-o para zero bytes primeiro. */
-    (void)filename;
+    
+     /* Validação rígida contra ponteiros nulos ou comprimentos erráticos */
+    if (!g_mounted || !filename || strlen(filename) == 0 || strlen(filename) > SOFS_MAX_FILE_NAME_SIZE) 
+        return -1;
+
+    struct sofs_record rec;
+    /* Se o arquivo já estiver contido no diretório raiz */
+    if (find_dir_entry(filename, &rec, NULL) == 0) {
+        
+        /* Previne manipulação indevida sobre links na criação */
+        if (rec.TypeVal == TYPEVAL_LINK) return -1; 
+        
+        struct sofs_inode in;
+        if (read_inode(rec.inodeNumber, &in) != 0) return -1;
+        
+        /* Truncamento: todos os blocos de dados vinculados são liberados para 0 bytes */
+        free_inode_blocks(&in);
+        write_inode(rec.inodeNumber, &in);
+
+        /* Atribui e preenche um handle da Tabela de Arquivos Abertos */
+        for (int i = 0; i < MAX_OPEN_FILES; i++) {
+            if (!g_open_files[i].in_use) {
+                g_open_files[i].in_use = 1;
+                g_open_files[i].inode_num = rec.inodeNumber;
+                g_open_files[i].offset = 0;
+                return i;
+            }
+        }
+        return -1; /* Limite de arquivos abertos atingido */
+    }
+
+    /* Novo Registro: Inicia a alocação do arquivo inexistente */
+    int inode_num = alloc_inode();
+    if (inode_num < 0) return -1;
+
+    struct sofs_inode in;
+    memset(&in, 0, sizeof(in));
+    in.RefCounter = 1; /* O registro em diretório atua como a referência inicial */
+    
+    if (write_inode(inode_num, &in) != 0) {
+        free_inode(inode_num);
+        return -1;
+    }
+
+    /* Engaja o arquivo recém-criado na lista de entradas do Inode 0 */
+    if (add_dir_entry(filename, inode_num, TYPEVAL_REGULAR) != 0) {
+        free_inode(inode_num);
+        return -1;
+    }
+
+    /* Atribui e preenche o correspondente handle em memória para uso contínuo */
+    for (int i = 0; i < MAX_OPEN_FILES; i++) {
+        if (!g_open_files[i].in_use) {
+            g_open_files[i].in_use = 1;
+            g_open_files[i].inode_num = inode_num;
+            g_open_files[i].offset = 0;
+            return i;
+        }
+    }
+
     return -1;
 }
 
 int sofs_delete(char *name)
 {
-    /* TODO: localiza o registro de diretório de <name>, libera todos os blocos
+    /* Localiza o registro de diretório de <name>, libera todos os blocos
      * de dados referenciados pelo i-node (free_data_block), libera o i-node
      * (free_inode) e invalida o registro de diretório. */
-    (void)name;
-    return -1;
+
+    if (!g_mounted || !name) return -1;
+
+    unsigned int offset;
+    struct sofs_record rec;
+    
+    /* Extrai o offset absoluto da entrada dentro da estrutura em disco do diretório */
+    if (find_dir_entry(name, &rec, &offset) != 0) return -1;
+
+    struct sofs_inode in;
+    if (read_inode(rec.inodeNumber, &in) == 0) {
+        /* Se houver outros hardlinks que exijam o conteúdo, ele apenas decrementa o contador */
+        if (in.RefCounter > 1) {
+            in.RefCounter--;
+            write_inode(rec.inodeNumber, &in);
+        } else {
+            /* Se for o último vínculo nominal, erradica permanentemente os dados */
+            free_inode_blocks(&in);
+            free_inode(rec.inodeNumber);
+        }
+    }
+
+    /* Neutraliza a entrada no arquivo do diretório, liberando o slot para reutilização futura */
+    remove_dir_entry(offset);
+    return 0;
 }
 
 SOFS_FILE sofs_open(char *name)
 {
-    /* TODO: localiza o registro de diretório de <name>, verifica que o arquivo
+    /* Localiza o registro de diretório de <name>, verifica que o arquivo
      * existe, aloca uma entrada na tabela de arquivos abertos, inicializa o
      * ponteiro de posição em 0 e retorna o handle. */
-    (void)name;
+
+    if (!g_mounted || !name) return -1;
+
+    struct sofs_record rec;
+    if (find_dir_entry(name, &rec, NULL) != 0) return -1;
+
+    unsigned int inode_to_open = rec.inodeNumber;
+
+    /* Lógica de Transição Transparente para Softlinks */
+    /* Caso aberto um link simbólico, o sistema processa automaticamente a re-resolução de alvo */
+    if (rec.TypeVal == TYPEVAL_LINK) {
+        struct sofs_inode link_in;
+        if (read_inode(rec.inodeNumber, &link_in) != 0) return -1;
+
+        unsigned int block_size = g_superbloco.blockSize * SECTOR_SIZE;
+        unsigned char buf[block_size];
+        
+        int phys_block = get_block_from_inode(&link_in, 0);
+        if (phys_block <= 0 || read_block(phys_block, buf) != 0) return -1;
+
+        char target_name[SOFS_MAX_FILE_NAME_SIZE + 1];
+        strncpy(target_name, (char*)buf, SOFS_MAX_FILE_NAME_SIZE);
+        target_name[SOFS_MAX_FILE_NAME_SIZE] = '\0';
+
+        /* Resolve o i-node definitivo apontado pela string contida no data block do softlink */
+        struct sofs_record target_rec;
+        if (find_dir_entry(target_name, &target_rec, NULL) != 0) return -1;
+        inode_to_open = target_rec.inodeNumber;
+    }
+
+    /* Indexa o arquivo na tabela isolada */
+    for (int i = 0; i < MAX_OPEN_FILES; i++) {
+        if (!g_open_files[i].in_use) {
+            g_open_files[i].in_use = 1;
+            g_open_files[i].inode_num = inode_to_open;
+            g_open_files[i].offset = 0;
+            return i;
+        }
+    }
     return -1;
 }
 
 int sofs_close(SOFS_FILE handle)
 {
-    /* TODO: valida <handle> e libera sua entrada na tabela de arquivos abertos. */
-    (void)handle;
-    return -1;
+    /* Valida <handle> e libera sua entrada na tabela de arquivos abertos. */
+
+     /* Valida a coerência do manipulador recebido garantindo sua presença ativa na tabela */
+    if (!g_mounted || handle < 0 || handle >= MAX_OPEN_FILES || !g_open_files[handle].in_use) 
+        return -1;
+
+    /* Abate o uso do slot na tabela isolada na RAM */
+    g_open_files[handle].in_use = 0;
+    return 0;
 }
 
 int sofs_read(SOFS_FILE handle, char *buffer, int size)
 {
-    /* TODO: lê até <size> bytes do arquivo a partir da posição corrente;
+    /* Lê até <size> bytes do arquivo a partir da posição corrente;
      * avança o ponteiro de posição; retorna o número de bytes efetivamente lidos. */
-    (void)handle;
-    (void)buffer;
-    (void)size;
-    return -1;
+    
+    if (!g_mounted || handle < 0 || handle >= MAX_OPEN_FILES || !g_open_files[handle].in_use || !buffer || size < 0) 
+        return -1;
+    if (size == 0) return 0;
+
+    struct open_file_entry *of = &g_open_files[handle];
+    struct sofs_inode in;
+    if (read_inode(of->inode_num, &in) != 0) return -1;
+
+    if (of->offset >= in.bytesFileSize) return 0; /* Atingiu Fim de Arquivo (EOF) */
+
+    /* Regula o limite matemático da leitura baseando-se no limite do bytesFileSize */
+    unsigned int bytes_to_read = size;
+    if (of->offset + bytes_to_read > in.bytesFileSize) {
+        bytes_to_read = in.bytesFileSize - of->offset;
+    }
+
+    unsigned int bytes_read = 0;
+    unsigned int block_size = g_superbloco.blockSize * SECTOR_SIZE;
+    unsigned char buf[block_size];
+
+    /* Algoritmo de Fracionamento Cíclico: lê iterativamente os bytes do disco convertendo offsets relativos */
+    while (bytes_read < bytes_to_read) {
+        unsigned int logical_block = of->offset / block_size;
+        unsigned int offset_in_block = of->offset % block_size;
+        unsigned int chunk = block_size - offset_in_block;
+        
+        if (chunk > bytes_to_read - bytes_read) 
+            chunk = bytes_to_read - bytes_read;
+
+        int phys_block = get_block_from_inode(&in, logical_block);
+        if (phys_block <= 0 || read_block(phys_block, buf) != 0) return -1;
+
+        memcpy(buffer + bytes_read, buf + offset_in_block, chunk);
+        
+        bytes_read += chunk;
+        of->offset += chunk; /* Avança o apontador estrito do usuário na memória */
+    }
+
+    return bytes_read;
 }
 
 int sofs_write(SOFS_FILE handle, char *buffer, int size)
 {
-    /* TODO: grava <size> bytes no arquivo a partir da posição corrente,
+    /* Grava <size> bytes no arquivo a partir da posição corrente,
      * alocando novos blocos de dados conforme necessário (alloc_data_block);
      * avança o ponteiro de posição; retorna o número de bytes gravados. */
-    (void)handle;
-    (void)buffer;
-    (void)size;
-    return -1;
+    
+    if (!g_mounted || handle < 0 || handle >= MAX_OPEN_FILES || !g_open_files[handle].in_use || !buffer || size < 0) 
+        return -1;
+    if (size == 0) return 0;
+
+    struct open_file_entry *of = &g_open_files[handle];
+    struct sofs_inode in;
+    if (read_inode(of->inode_num, &in) != 0) return -1;
+
+    unsigned int bytes_written = 0;
+    unsigned int block_size = g_superbloco.blockSize * SECTOR_SIZE;
+    unsigned char buf[block_size];
+
+    while (bytes_written < (unsigned int)size) {
+        unsigned int logical_block = of->offset / block_size;
+        unsigned int offset_in_block = of->offset % block_size;
+        unsigned int chunk = block_size - offset_in_block;
+        
+        if (chunk > (unsigned int)size - bytes_written) 
+            chunk = (unsigned int)size - bytes_written;
+
+        int phys_block = get_block_from_inode(&in, logical_block);
+        
+        /* Delegação autônoma de blocos dinâmicos quando a escrita atravessa a barreira do EOF */
+        if (phys_block <= 0) {
+            phys_block = allocate_block_for_inode(&in, logical_block);
+            if (phys_block < 0) break; /* Rompeu a capacidade global livre de disco */
+            memset(buf, 0, block_size);
+        } else {
+            if (read_block(phys_block, buf) != 0) break;
+        }
+
+        memcpy(buf + offset_in_block, buffer + bytes_written, chunk);
+        if (write_block(phys_block, buf) != 0) break;
+
+        bytes_written += chunk;
+        of->offset += chunk;
+    }
+
+    /* Consolida expansão volumétrica caso o ponteiro desloque para o além-marcado */
+    if (of->offset > in.bytesFileSize) {
+        in.bytesFileSize = of->offset;
+    }
+    
+    write_inode(of->inode_num, &in);
+
+    if (bytes_written == 0 && size > 0) return -1;
+    return bytes_written;
 }
 
 /* -------------------------------------------------------------------------
- * Operações de diretório (TODO)
+ * Operações de diretório
  * ---------------------------------------------------------------------- */
 
 int sofs_opendir(void)
 {
-    /* TODO: verifica que uma partição está montada, posiciona o ponteiro de
+    /* Verifica que uma partição está montada, posiciona o ponteiro de
      * entradas no primeiro registro válido do diretório raiz e retorna 0. */
-    return -1;
+    
+    if (!g_mounted) return -1;
+    g_dir_offset = 0; /* Configuração de reset estrutural do ponteiro em memória */
+    return 0;
 }
 
 int sofs_readdir(SOFS_DIRENT *dentry)
 {
-    /* TODO: lê o próximo registro válido do diretório em *dentry e avança o
+    /* Lê o próximo registro válido do diretório em *dentry e avança o
      * ponteiro de entradas. Retorna valor diferente de zero ao fim do diretório. */
-    (void)dentry;
-    return -1;
+    
+    if (!g_mounted || !dentry) return -1;
+
+    struct sofs_inode root_in;
+    if (read_inode(0, &root_in) != 0) return -1;
+
+    unsigned int block_size = g_superbloco.blockSize * SECTOR_SIZE;
+    unsigned char buf[block_size];
+    int current_phys_block = -1;
+
+    /* Varredura progressiva sobre a trilha contínua do root_inode ignorando os slots em vazio */
+    while (g_dir_offset < root_in.bytesFileSize) {
+        unsigned int logical_block = g_dir_offset / block_size;
+        unsigned int offset_in_block = g_dir_offset % block_size;
+
+        int phys_block = get_block_from_inode(&root_in, logical_block);
+        if (phys_block <= 0) return -1;
+
+        if (current_phys_block != phys_block) {
+            if (read_block(phys_block, buf) != 0) return -1;
+            current_phys_block = phys_block;
+        }
+
+        struct sofs_record *rec = (struct sofs_record *)(buf + offset_in_block);
+        g_dir_offset += sizeof(struct sofs_record);
+
+        /* Extração nominal caso registro se prove intacto */
+        if (rec->TypeVal != TYPEVAL_INVALIDO) {
+            strncpy(dentry->name, rec->name, SOFS_MAX_FILE_NAME_SIZE);
+            dentry->name[SOFS_MAX_FILE_NAME_SIZE] = '\0';
+            dentry->fileType = rec->TypeVal;
+
+            struct sofs_inode target_in;
+            if (read_inode(rec->inodeNumber, &target_in) == 0) {
+                dentry->fileSize = target_in.bytesFileSize;
+            } else {
+                dentry->fileSize = 0;
+            }
+            return 0;
+        }
+    }
+    return -1; /* O fim do volume de bytes de escopo indica ausência de diretivas restantes */
 }
 
 int sofs_closedir(void)
 {
-    /* TODO: reinicia o ponteiro de entradas do diretório e retorna 0. */
-    return -1;
+    /* Reinicia o ponteiro de entradas do diretório e retorna 0. */
+
+    if (!g_mounted) return -1;
+    g_dir_offset = 0; /* Expurga o estado persistido */
+    return 0;
 }
 
 /* -------------------------------------------------------------------------
- * Operações de link (TODO)
+ * Operações de link
  * ---------------------------------------------------------------------- */
 
 int sofs_sln(char *linkname, char *filename)
 {
-    /* TODO: cria um softlink chamado <linkname> cujo único bloco de dados
+    /* Cria um softlink chamado <linkname> cujo único bloco de dados
      * contém o string <filename>. */
-    (void)linkname;
-    (void)filename;
-    return -1;
+    
+    if (!g_mounted || !linkname || !filename) return -1;
+
+    struct sofs_record dummy;
+    if (find_dir_entry(linkname, &dummy, NULL) == 0) return -1;
+
+    int inode_num = alloc_inode();
+    if (inode_num < 0) return -1;
+
+    struct sofs_inode in;
+    memset(&in, 0, sizeof(in));
+    in.RefCounter = 1;
+
+    /* O softlink aloja o string nominal do alvo nativamente em seu primeiro bloco de dados direto */
+    int phys_block = allocate_block_for_inode(&in, 0);
+    if (phys_block < 0) { free_inode(inode_num); return -1; }
+
+    unsigned int block_size = g_superbloco.blockSize * SECTOR_SIZE;
+    unsigned char buf[block_size];
+    memset(buf, 0, block_size);
+    strncpy((char*)buf, filename, block_size - 1);
+    write_block(phys_block, buf);
+
+    in.bytesFileSize = strlen(filename);
+    write_inode(inode_num, &in);
+
+    if (add_dir_entry(linkname, inode_num, TYPEVAL_LINK) != 0) {
+        free_inode_blocks(&in);
+        free_inode(inode_num);
+        return -1;
+    }
+    return 0;
 }
 
 int sofs_hln(char *linkname, char *filename)
 {
-    /* TODO: cria um hardlink chamado <linkname> apontando para o mesmo
+    /* Cria um hardlink chamado <linkname> apontando para o mesmo
      * i-node que <filename>; incrementa o campo RefCounter do i-node. */
-    (void)linkname;
-    (void)filename;
-    return -1;
+    
+    if (!g_mounted || !linkname || !filename) return -1;
+
+    struct sofs_record target_rec;
+    if (find_dir_entry(filename, &target_rec, NULL) != 0) return -1; 
+    
+    /* Prevenção técnica contra aninhamento irrestrito de links simbólicos por hardware links */
+    if (target_rec.TypeVal == TYPEVAL_LINK) return -1; 
+
+    struct sofs_record dummy;
+    if (find_dir_entry(linkname, &dummy, NULL) == 0) return -1; 
+
+    struct sofs_inode target_in;
+    if (read_inode(target_rec.inodeNumber, &target_in) != 0) return -1;
+
+    /* O espelhamento exato de hardlink não aloca memória nova; ele apenas amplifica contadores */
+    target_in.RefCounter++;
+    write_inode(target_rec.inodeNumber, &target_in);
+
+    if (add_dir_entry(linkname, target_rec.inodeNumber, target_rec.TypeVal) != 0) {
+        target_in.RefCounter--;
+        write_inode(target_rec.inodeNumber, &target_in);
+        return -1;
+    }
+    return 0;
 }
