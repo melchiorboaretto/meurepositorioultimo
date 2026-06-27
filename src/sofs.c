@@ -28,8 +28,8 @@ static int g_mounted = false;
 static struct sofs_superbloco g_superbloco;
 static unsigned int g_superbloco_sector;   /* setor absoluto do superbloco */
 
-/* Tabela de Arquivos Abertos (Capacidade para 256 arquivos abertos simultaneamente) */
-#define MAX_OPEN_FILES 256
+/* Tabela de Arquivos Abertos (Capacidade para 10 arquivos abertos simultaneamente) */
+#define MAX_OPEN_FILES 10
 struct open_file_entry {
     int in_use;             /* 0 se livre, 1 se ocupado */
     unsigned int inode_num; /* Índice do i-node referenciado */
@@ -222,6 +222,245 @@ static int free_inode(unsigned int inode_num)
         return -1;
 
     return setBitmap2(BITMAP_INODE, (int)inode_num, 0);
+}
+
+/* -------------------------------------------------------------------------
+ * Funções Auxiliares de manipulação Estrutural (Inodes/Diretório) 
+ * - Elas são usadas no TODO, mas deixamos separadas para visualização mais fácil e maior organização
+ * ---------------------------------------------------------------------- */
+
+/* Lê fisicamente um i-node específico do disco para uma estrutura em memória */
+static int read_inode(unsigned int inode_num, struct sofs_inode *inode) {
+    unsigned int block_size = g_superbloco.blockSize * SECTOR_SIZE;
+    unsigned int inodes_per_block = block_size / sizeof(struct sofs_inode);
+    unsigned int inode_block = 1 + g_superbloco.freeBlocksBitmapSize + g_superbloco.freeInodeBitmapSize + (inode_num / inodes_per_block);
+    unsigned int inode_offset = inode_num % inodes_per_block;
+
+    unsigned char buf[block_size];
+    if (read_block(inode_block, buf) != 0) return -1;
+    memcpy(inode, buf + inode_offset * sizeof(struct sofs_inode), sizeof(struct sofs_inode));
+    return 0;
+}
+
+/* Grava fisicamente um i-node específico da memória para o disco */
+static int write_inode(unsigned int inode_num, struct sofs_inode *inode) {
+    unsigned int block_size = g_superbloco.blockSize * SECTOR_SIZE;
+    unsigned int inodes_per_block = block_size / sizeof(struct sofs_inode);
+    unsigned int inode_block = 1 + g_superbloco.freeBlocksBitmapSize + g_superbloco.freeInodeBitmapSize + (inode_num / inodes_per_block);
+    unsigned int inode_offset = inode_num % inodes_per_block;
+
+    unsigned char buf[block_size];
+    if (read_block(inode_block, buf) != 0) return -1;
+    memcpy(buf + inode_offset * sizeof(struct sofs_inode), inode, sizeof(struct sofs_inode));
+    return write_block(inode_block, buf);
+}
+
+/* Resolve e retorna o número absoluto do bloco físico a partir de um bloco lógico (índice 0, 1, 2...) */
+static int get_block_from_inode(struct sofs_inode *inode, unsigned int logical_block) {
+    /* Lógica para ponteiros diretos (0 e 1) */
+    if (logical_block < 2) {
+        return inode->dataPtr[logical_block];
+    }
+    
+    unsigned int block_size = g_superbloco.blockSize * SECTOR_SIZE;
+    unsigned int ptrs_per_block = block_size / sizeof(DWORD);
+    
+    /* Lógica para indireção simples */
+    if (logical_block < 2 + ptrs_per_block) {
+        if (inode->singleIndPtr == 0) return 0;
+        unsigned char buf[block_size];
+        if (read_block(inode->singleIndPtr, buf) != 0) return -1;
+        DWORD *ptrs = (DWORD *)buf;
+        return ptrs[logical_block - 2];
+    }
+    /* Ponteiros duplamente indiretos não foram exigidos, retorna zero. */
+    return 0; 
+}
+
+/* Aloca um novo bloco físico e o mapeia no índice lógico do respectivo i-node */
+static int allocate_block_for_inode(struct sofs_inode *inode, unsigned int logical_block) {
+    int new_block = alloc_data_block();
+    if (new_block < 0) return -1;
+
+    unsigned int block_size = g_superbloco.blockSize * SECTOR_SIZE;
+    unsigned int ptrs_per_block = block_size / sizeof(DWORD);
+
+    /* Aloca no ponteiro direto */
+    if (logical_block < 2) {
+        inode->dataPtr[logical_block] = new_block;
+    } 
+    /* Aloca no ponteiro indireto simples */
+    else if (logical_block < 2 + ptrs_per_block) {
+        if (inode->singleIndPtr == 0) {
+            int ind_block = alloc_data_block();
+            if (ind_block < 0) { free_data_block(new_block); return -1; }
+            inode->singleIndPtr = ind_block;
+            inode->blocksFileSize++;
+        }
+        unsigned char buf[block_size];
+        if (read_block(inode->singleIndPtr, buf) != 0) return -1;
+        DWORD *ptrs = (DWORD *)buf;
+        ptrs[logical_block - 2] = new_block;
+        if (write_block(inode->singleIndPtr, buf) != 0) return -1;
+    } else {
+        free_data_block(new_block);
+        return -1;
+    }
+    inode->blocksFileSize++;
+    return new_block;
+}
+
+/* Libera sistematicamente todos os blocos de dados associados a um i-node */
+static void free_inode_blocks(struct sofs_inode *inode) {
+    unsigned int block_size = g_superbloco.blockSize * SECTOR_SIZE;
+    unsigned int ptrs_per_block = block_size / sizeof(DWORD);
+
+    /* Libera blocos diretos */
+    for (int i = 0; i < 2; i++) {
+        if (inode->dataPtr[i] != 0) {
+            free_data_block(inode->dataPtr[i]);
+            inode->dataPtr[i] = 0;
+        }
+    }
+    /* Libera blocos mapeados pela indireção simples */
+    if (inode->singleIndPtr != 0) {
+        unsigned char buf[block_size];
+        if (read_block(inode->singleIndPtr, buf) == 0) {
+            DWORD *ptrs = (DWORD *)buf;
+            for (unsigned int i = 0; i < ptrs_per_block; i++) {
+                if (ptrs[i] != 0) free_data_block(ptrs[i]);
+            }
+        }
+        free_data_block(inode->singleIndPtr);
+        inode->singleIndPtr = 0;
+    }
+    inode->blocksFileSize = 0;
+    inode->bytesFileSize = 0;
+}
+
+/* Busca sequencialmente um arquivo pelo nome no Diretório Raiz (i-node 0) */
+static int find_dir_entry(const char *name, struct sofs_record *out_rec, unsigned int *out_offset) {
+    struct sofs_inode root_inode;
+    if (read_inode(0, &root_inode) != 0) return -1;
+
+    unsigned int offset = 0;
+    unsigned int block_size = g_superbloco.blockSize * SECTOR_SIZE;
+    unsigned char buf[block_size];
+    int current_phys_block = -1;
+
+    while (offset < root_inode.bytesFileSize) {
+        unsigned int logical_block = offset / block_size;
+        unsigned int offset_in_block = offset % block_size;
+
+        int phys_block = get_block_from_inode(&root_inode, logical_block);
+        if (phys_block <= 0) break;
+
+        /* Carrega o bloco para a memória apenas se o bloco físico mudar no iterador */
+        if (current_phys_block != phys_block) {
+            if (read_block(phys_block, buf) != 0) break;
+            current_phys_block = phys_block;
+        }
+
+        struct sofs_record *rec = (struct sofs_record *)(buf + offset_in_block);
+        if (rec->TypeVal != TYPEVAL_INVALIDO && strcmp(rec->name, name) == 0) {
+            if (out_rec) *out_rec = *rec;
+            if (out_offset) *out_offset = offset;
+            return 0; /* Arquivo encontrado */
+        }
+        offset += sizeof(struct sofs_record);
+    }
+    return -1; /* Arquivo não encontrado */
+}
+
+/* Registra uma nova entrada no Diretório Raiz buscando slot vazio ou expandindo o tamanho */
+static int add_dir_entry(const char *name, unsigned int inode_num, BYTE typeVal) {
+    struct sofs_inode root_inode;
+    if (read_inode(0, &root_inode) != 0) return -1;
+
+    unsigned int offset = 0;
+    unsigned int block_size = g_superbloco.blockSize * SECTOR_SIZE;
+    unsigned char buf[block_size];
+    int current_phys_block = -1;
+    unsigned int target_offset = 0xFFFFFFFF;
+    int found_empty = 0;
+
+    /* Pesquisa o primeiro slot inválido (disponível) dentro do tamanho atual do diretório */
+    while (offset < root_inode.bytesFileSize) {
+        unsigned int logical_block = offset / block_size;
+        unsigned int offset_in_block = offset % block_size;
+
+        int phys_block = get_block_from_inode(&root_inode, logical_block);
+        if (phys_block <= 0) break;
+
+        if (current_phys_block != phys_block) {
+            if (read_block(phys_block, buf) != 0) return -1;
+            current_phys_block = phys_block;
+        }
+
+        struct sofs_record *rec = (struct sofs_record *)(buf + offset_in_block);
+        if (rec->TypeVal == TYPEVAL_INVALIDO) {
+            target_offset = offset;
+            found_empty = 1;
+            break;
+        }
+        offset += sizeof(struct sofs_record);
+    }
+
+    /* Caso não encontre buracos, expande o final do arquivo de diretório */
+    if (!found_empty) {
+        target_offset = root_inode.bytesFileSize;
+    }
+
+    unsigned int logical_block = target_offset / block_size;
+    unsigned int offset_in_block = target_offset % block_size;
+
+    int phys_block = get_block_from_inode(&root_inode, logical_block);
+    if (phys_block <= 0) {
+        /* Se o offset exige um novo bloco que não existe, nós o alocamos */
+        phys_block = allocate_block_for_inode(&root_inode, logical_block);
+        if (phys_block < 0) return -1;
+        memset(buf, 0, block_size);
+    } else {
+        if (read_block(phys_block, buf) != 0) return -1;
+    }
+
+    /* Modifica o bloco de dados mapeando a estrutura sofs_record */
+    struct sofs_record *rec = (struct sofs_record *)(buf + offset_in_block);
+    rec->TypeVal = typeVal;
+    strncpy(rec->name, name, 50);
+    rec->name[50] = '\0';
+    rec->inodeNumber = inode_num;
+
+    /* Persiste as modificações no disco */
+    if (write_block(phys_block, buf) != 0) return -1;
+
+    /* Atualiza os metadados de tamanho do diretório se este tiver expandido */
+    if (target_offset + sizeof(struct sofs_record) > root_inode.bytesFileSize) {
+        root_inode.bytesFileSize = target_offset + sizeof(struct sofs_record);
+    }
+    
+    return write_inode(0, &root_inode);
+}
+
+/* Invalida logicamente uma entrada baseada no seu offset absoluto dentro do diretório */
+static int remove_dir_entry(unsigned int offset) {
+    struct sofs_inode root_inode;
+    if (read_inode(0, &root_inode) != 0) return -1;
+
+    unsigned int block_size = g_superbloco.blockSize * SECTOR_SIZE;
+    unsigned int logical_block = offset / block_size;
+    unsigned int offset_in_block = offset % block_size;
+
+    int phys_block = get_block_from_inode(&root_inode, logical_block);
+    if (phys_block <= 0) return -1;
+
+    unsigned char buf[block_size];
+    if (read_block(phys_block, buf) != 0) return -1;
+
+    struct sofs_record *rec = (struct sofs_record *)(buf + offset_in_block);
+    rec->TypeVal = TYPEVAL_INVALIDO;
+
+    return write_block(phys_block, buf);
 }
 
 /* -------------------------------------------------------------------------
