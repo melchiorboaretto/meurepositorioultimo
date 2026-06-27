@@ -1,0 +1,12 @@
+=== Exemplo 4: Cadeias de Softlinks e Ciclos ===
+
+--- Teste A: Resolução em Cascata ---
+Criando estrutura: link_C -> link_B -> link_A -> alvo_real.txt
+Leitura efetuada a partir de 'link_C' (17 bytes): Dados via Cascata
+
+--- Teste B: Prevenção de Ciclo Infinito ---
+Criando ciclo estrutural fechado: loop1 -> loop2 -> loop1
+Tentando abrir 'loop1'...
+Resultado: SUCESSO. A abertura foi abortada pelo sistema, prevenindo o ciclo infinito.
+
+Teste concluído.

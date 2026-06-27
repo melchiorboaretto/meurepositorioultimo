@@ -1,0 +1,23 @@
+=== Exemplo 3: Teste de Limite de Arquivos Abertos ===
+Tentando criar e manter abertos 15 arquivos simultaneamente...
+  [OK] Arquivo 'arquivo_limite_0.txt' aberto com handle 0
+  [OK] Arquivo 'arquivo_limite_1.txt' aberto com handle 1
+  [OK] Arquivo 'arquivo_limite_2.txt' aberto com handle 2
+  [OK] Arquivo 'arquivo_limite_3.txt' aberto com handle 3
+  [OK] Arquivo 'arquivo_limite_4.txt' aberto com handle 4
+  [OK] Arquivo 'arquivo_limite_5.txt' aberto com handle 5
+  [OK] Arquivo 'arquivo_limite_6.txt' aberto com handle 6
+  [OK] Arquivo 'arquivo_limite_7.txt' aberto com handle 7
+  [OK] Arquivo 'arquivo_limite_8.txt' aberto com handle 8
+  [OK] Arquivo 'arquivo_limite_9.txt' aberto com handle 9
+  [BLOQUEADO] Falha ao abrir 'arquivo_limite_10.txt'. Limite possivelmente atingido.
+  [BLOQUEADO] Falha ao abrir 'arquivo_limite_11.txt'. Limite possivelmente atingido.
+  [BLOQUEADO] Falha ao abrir 'arquivo_limite_12.txt'. Limite possivelmente atingido.
+  [BLOQUEADO] Falha ao abrir 'arquivo_limite_13.txt'. Limite possivelmente atingido.
+  [BLOQUEADO] Falha ao abrir 'arquivo_limite_14.txt'. Limite possivelmente atingido.
+
+Total de arquivos abertos com sucesso: 10
+Resultado: SUCESSO. O sistema limitou corretamente a 10 arquivos.
+
+Fechando todos os arquivos abertos...
+Teste concluído.

@@ -1,0 +1,62 @@
+Identificação: Grupo M
+
+Formatando partição 0 com 2 setores/bloco...
+sofs_format: OK
+
+Montando partição 0...
+sofs_mount: OK
+
+=== Conteúdo do diretório raiz ===
+=== Fim do diretório ===
+
+Criando arquivo 'teste.txt'...
+  sofs_write: 11 bytes gravados
+Criando arquivo 'dados.bin'...
+Lendo arquivo 'teste.txt'...
+  sofs_read: 11 bytes lidos: "Olá, sofs!"
+=== Conteúdo do diretório raiz ===
+  teste.txt                                           tipo=regular  tamanho=11 bytes
+  dados.bin                                           tipo=regular  tamanho=256 bytes
+=== Fim do diretório ===
+
+Criando softlink 'link_soft' -> 'teste.txt'...
+  sofs_sln: OK
+Criando hardlink 'link_hard' -> 'dados.bin'...
+  sofs_hln: OK
+=== Conteúdo do diretório raiz ===
+  teste.txt                                           tipo=regular  tamanho=11 bytes
+  dados.bin                                           tipo=regular  tamanho=256 bytes
+  link_soft                                           tipo=link  tamanho=9 bytes
+  link_hard                                           tipo=regular  tamanho=256 bytes
+=== Fim do diretório ===
+
+Removendo arquivo 'teste.txt'...
+  sofs_delete: OK
+=== Conteúdo do diretório raiz ===
+  dados.bin                                           tipo=regular  tamanho=256 bytes
+  link_soft                                           tipo=link  tamanho=9 bytes
+  link_hard                                           tipo=regular  tamanho=256 bytes
+=== Fim do diretório ===
+
+=== Teste Avançado: Indireção e Truncamento ===
+  sofs_write: 71680 bytes gravados em 'arquivo_pesado.bin' (Teste de Indireção)
+=== Conteúdo do diretório raiz ===
+  arquivo_pesado.bin                                  tipo=regular  tamanho=71680 bytes
+  dados.bin                                           tipo=regular  tamanho=256 bytes
+  link_soft                                           tipo=link  tamanho=9 bytes
+  link_hard                                           tipo=regular  tamanho=256 bytes
+=== Fim do diretório ===
+
+Recriando 'arquivo_pesado.bin' para testar truncamento atômico...
+  sofs_create: Arquivo recriado. O tamanho atual deve ser 0 bytes.
+=== Conteúdo do diretório raiz ===
+  arquivo_pesado.bin                                  tipo=regular  tamanho=0 bytes
+  dados.bin                                           tipo=regular  tamanho=256 bytes
+  link_soft                                           tipo=link  tamanho=9 bytes
+  link_hard                                           tipo=regular  tamanho=256 bytes
+=== Fim do diretório ===
+
+Desmontando partição...
+sofs_umount: OK
+
+Exemplo concluído.

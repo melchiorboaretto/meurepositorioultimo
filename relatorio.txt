@@ -1,0 +1,43 @@
+Relatório Técnico Final de Implementação do Sistema de Arquivos SOFS
+
+Este documento consolida a totalidade das alterações arquiteturais e algorítmicas realizadas no arquivo "sofs.c" para a implementação completa da especificação do sistema de arquivos SOFS. O relatório contempla tanto as estruturas da implementação base quanto os refinamentos críticos aplicados para garantir a integridade dos dados e o cumprimento estrito do comportamento POSIX/UNIX.
+
+Estruturas de Dados em Memória
+
+g_open_files (Tabela de Arquivos Abertos): Vetor alocado com a estrutura "struct open_file_entry", restrito à capacidade exata de 10 arquivos abertos simultaneamente (MAX_OPEN_FILES = 10). É responsável por isolar em memória RAM o estado de uso, o identificador do i-node alvo e o ponteiro de posição corrente (offset em bytes) de cada fluxo de E/S ativo.
+
+g_dir_offset: Variável escalar global que atua como iterador persistente em memória para coordenar as operações de varredura sequencial do diretório raiz.
+
+Funções Auxiliares e Manipulação Física
+
+read_inode e write_inode: Executam o cálculo matemático que traduz o índice lógico do i-node para sua posição física absoluta (bloco e deslocamento intra-bloco) na área de i-nodes, intermediando a transferência da estrutura "struct sofs_inode" entre memória e disco.
+
+Indireção Dupla e Resolução Lógico-Física (get_block_from_inode, allocate_block_for_inode, free_inode_blocks): Funções responsáveis pelo mapeamento e delegação de blocos de dados. Foram integralmente projetadas para suportar dois ponteiros diretos, um ponteiro de indireção simples (singleIndPtr) e um ponteiro de indireção dupla (doubleIndPtr). A indireção dupla utiliza operações de divisão inteira e resto modular para escalar dois níveis de blocos de índice na partição física, suportando corretamente arquivos de grande porte.
+
+Manipulação de Diretório (find_dir_entry, add_dir_entry, remove_dir_entry): Abstraem a busca sequencial linear, a alocação dinâmica (com expansão automatizada de blocos do diretório) e a invalidação lógica (modificação do byte para TYPEVAL_INVALIDO) dos registros "struct sofs_record" no escopo restrito do i-node 0.
+
+Implementação dos TODOs 
+
+3.1. Formatação e Montagem
+
+sofs_format: Implementamos a inicialização com zeros das áreas de bitmap e de i-nodes
+
+3.2. Operações de Arquivo e Tolerância a Falhas
+
+sofs_create (Garantia de Integridade no Truncamento): Implementa validação atômica de disponibilidade. Ao atuar sobre um arquivo preexistente, o sistema rastreia slots livres na tabela "g_open_files" previamente. A rotina de liberação de blocos físicos (free_inode_blocks), que trunca o arquivo para 0 bytes, é estritamente invocada apenas se houver garantia matemática de alocação do descritor. Isso impossibilita a destruição irrecuperável de dados devido à exaustão de descritores de arquivo.
+
+sofs_delete: Deleção condicional amarrada ao "RefCounter". O descarte permanente de blocos físicos do disco só ocorre se a métrica de referência do i-node alcançar o valor zero.
+
+sofs_open (Prevenção de Ciclos Infinitos): O sistema de desreferenciamento de softlinks utiliza um laço iterativo (while) fixado a um teto máximo de 10 níveis de indireção nominal. Isso possibilita a resolução ininterrupta de cadeias de softlinks, abortando a operação com falha imediata se detectar um ciclo infinito de referências (loops em disco).
+
+sofs_write (Proteção de Metadados): Adição de barreira de sincronização de estado. O algoritmo efetua uma releitura isolada ("read_inode") para repovoar os campos vulneráveis da estrutura em memória (como o "RefCounter") lendo o status fático em disco logo antes da sobrescrita. Esse isolamento previne condições de corrida (race conditions) destrutivas onde rotinas paralelas de "sofs_hln" perderiam suas referências pela regravação concorrente do tamanho do arquivo ("bytesFileSize").
+
+3.3. Operações de Diretório
+
+sofs_opendir, sofs_readdir e sofs_closedir: Manipulam o rastreio iterativo via "g_dir_offset", calculando saltos regulares de 64 bytes lógicos. Preenchem a estrutura "SOFS_DIRENT" apenas perante confirmação em disco de integridade não nula do identificador "TypeVal".
+
+3.4. Operações de Link
+
+sofs_sln (Softlink): Instancia i-nodes nominais sob a diretriz "TYPEVAL_LINK", gravando o string alvo incondicionalmente 1no espaço do primeiro bloco físico direto associado ao link.
+
+sofs_hln (Hardlink e Adequação POSIX): Dispensa alocação de blocos de dados. A função homologa a criação de hardlinks sobre i-nodes mapeados como softlinks. Isso adequa a implementação às normas semânticas do ambiente POSIX, limitando-se unicamente ao incremento da contagem de integridade ("RefCounter") do i-node nativo.

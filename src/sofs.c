@@ -5,11 +5,11 @@
  * a camada de bitmap (bitmap2) gerencia o controle de blocos e i-nodes livres.
  *
  * Layout do sistema de arquivos dentro de uma partição (em ordem):
- *   [bloco 0]          superbloco
- *   [blocos 1 .. bb]   bitmap de blocos livres   (bb = freeBlocksBitmapSize)
- *   [bb+1 .. bb+bi]    bitmap de i-nodes livres  (bi = freeInodeBitmapSize)
- *   [bb+bi+1 .. ...]   área de i-nodes           (10% dos blocos, arredondado para cima)
- *   [resto]            blocos de dados
+ * [bloco 0]          superbloco
+ * [blocos 1 .. bb]   bitmap de blocos livres   (bb = freeBlocksBitmapSize)
+ * [bb+1 .. bb+bi]    bitmap de i-nodes livres  (bi = freeInodeBitmapSize)
+ * [bb+bi+1 .. ...]   área de i-nodes           (10% dos blocos, arredondado para cima)
+ * [resto]            blocos de dados
  *
  * As funções marcadas com TODO são responsabilidade do grupo.
  * As funções auxiliares alloc_data_block(), free_data_block(),
@@ -130,8 +130,8 @@ static int alloc_data_block(void)
 /*
  * free_data_block - libera um bloco de dados previamente alocado.
  *
- *   abs_block_num : número absoluto do bloco na partição (conforme
- *                   retornado por alloc_data_block).
+ * abs_block_num : número absoluto do bloco na partição (conforme
+ * retornado por alloc_data_block).
  *
  * Retorna 0 em caso de sucesso; -1 em caso de erro.
  */
@@ -212,7 +212,7 @@ static int alloc_inode(void)
 /*
  * free_inode - libera um i-node previamente alocado.
  *
- *   inode_num : número do i-node (conforme retornado por alloc_inode).
+ * inode_num : número do i-node (conforme retornado por alloc_inode).
  *
  * Retorna 0 em caso de sucesso; -1 em caso de erro.
  */
@@ -273,7 +273,26 @@ static int get_block_from_inode(struct sofs_inode *inode, unsigned int logical_b
         DWORD *ptrs = (DWORD *)buf;
         return ptrs[logical_block - 2];
     }
-    /* Ponteiros duplamente indiretos não foram exigidos, retorna zero. */
+    
+    /* Lógica para indireção dupla implementada para suportar arquivos maiores */
+    else if (logical_block < 2 + ptrs_per_block + (ptrs_per_block * ptrs_per_block)) {
+        if (inode->doubleIndPtr == 0) return 0;
+        unsigned char buf1[block_size];
+        if (read_block(inode->doubleIndPtr, buf1) != 0) return -1;
+        DWORD *ptrs1 = (DWORD *)buf1;
+        
+        unsigned int double_idx = logical_block - 2 - ptrs_per_block;
+        unsigned int idx1 = double_idx / ptrs_per_block;
+        unsigned int idx2 = double_idx % ptrs_per_block;
+        
+        if (ptrs1[idx1] == 0) return 0;
+        
+        unsigned char buf2[block_size];
+        if (read_block(ptrs1[idx1], buf2) != 0) return -1;
+        DWORD *ptrs2 = (DWORD *)buf2;
+        return ptrs2[idx2];
+    }
+    
     return 0; 
 }
 
@@ -302,7 +321,38 @@ static int allocate_block_for_inode(struct sofs_inode *inode, unsigned int logic
         DWORD *ptrs = (DWORD *)buf;
         ptrs[logical_block - 2] = new_block;
         if (write_block(inode->singleIndPtr, buf) != 0) return -1;
-    } else {
+    } 
+    /* Aloca no ponteiro indireto duplo implementado */
+    else if (logical_block < 2 + ptrs_per_block + (ptrs_per_block * ptrs_per_block)) {
+        if (inode->doubleIndPtr == 0) {
+            int ind_block1 = alloc_data_block();
+            if (ind_block1 < 0) { free_data_block(new_block); return -1; }
+            inode->doubleIndPtr = ind_block1;
+            inode->blocksFileSize++;
+        }
+        unsigned char buf1[block_size];
+        if (read_block(inode->doubleIndPtr, buf1) != 0) return -1;
+        DWORD *ptrs1 = (DWORD *)buf1;
+        
+        unsigned int double_idx = logical_block - 2 - ptrs_per_block;
+        unsigned int idx1 = double_idx / ptrs_per_block;
+        unsigned int idx2 = double_idx % ptrs_per_block;
+        
+        if (ptrs1[idx1] == 0) {
+            int ind_block2 = alloc_data_block();
+            if (ind_block2 < 0) { free_data_block(new_block); return -1; } 
+            ptrs1[idx1] = ind_block2;
+            if (write_block(inode->doubleIndPtr, buf1) != 0) return -1;
+            inode->blocksFileSize++;
+        }
+        
+        unsigned char buf2[block_size];
+        if (read_block(ptrs1[idx1], buf2) != 0) return -1;
+        DWORD *ptrs2 = (DWORD *)buf2;
+        ptrs2[idx2] = new_block;
+        if (write_block(ptrs1[idx1], buf2) != 0) return -1;
+    }
+    else {
         free_data_block(new_block);
         return -1;
     }
@@ -334,6 +384,29 @@ static void free_inode_blocks(struct sofs_inode *inode) {
         free_data_block(inode->singleIndPtr);
         inode->singleIndPtr = 0;
     }
+    
+    /* Libera os blocos mapeados pela indireção dupla */
+    if (inode->doubleIndPtr != 0) {
+        unsigned char buf1[block_size];
+        if (read_block(inode->doubleIndPtr, buf1) == 0) {
+            DWORD *ptrs1 = (DWORD *)buf1;
+            for (unsigned int i = 0; i < ptrs_per_block; i++) {
+                if (ptrs1[i] != 0) {
+                    unsigned char buf2[block_size];
+                    if (read_block(ptrs1[i], buf2) == 0) {
+                        DWORD *ptrs2 = (DWORD *)buf2;
+                        for (unsigned int j = 0; j < ptrs_per_block; j++) {
+                            if (ptrs2[j] != 0) free_data_block(ptrs2[j]);
+                        }
+                    }
+                    free_data_block(ptrs1[i]);
+                }
+            }
+        }
+        free_data_block(inode->doubleIndPtr);
+        inode->doubleIndPtr = 0;
+    }
+    
     inode->blocksFileSize = 0;
     inode->bytesFileSize = 0;
 }
@@ -626,6 +699,16 @@ SOFS_FILE sofs_create(char *filename)
         /* Previne manipulação indevida sobre links na criação */
         if (rec.TypeVal == TYPEVAL_LINK) return -1; 
         
+        /* Verifica se há espaço na tabela de arquivos abertos ANTES de truncar o arquivo existente */
+        int handle_livre = -1;
+        for (int i = 0; i < MAX_OPEN_FILES; i++) {
+            if (!g_open_files[i].in_use) {
+                handle_livre = i;
+                break;
+            }
+        }
+        if (handle_livre == -1) return -1; /* Limite de arquivos abertos atingido, aborta antes de destruir os dados */
+
         struct sofs_inode in;
         if (read_inode(rec.inodeNumber, &in) != 0) return -1;
         
@@ -634,15 +717,10 @@ SOFS_FILE sofs_create(char *filename)
         write_inode(rec.inodeNumber, &in);
 
         /* Atribui e preenche um handle da Tabela de Arquivos Abertos */
-        for (int i = 0; i < MAX_OPEN_FILES; i++) {
-            if (!g_open_files[i].in_use) {
-                g_open_files[i].in_use = 1;
-                g_open_files[i].inode_num = rec.inodeNumber;
-                g_open_files[i].offset = 0;
-                return i;
-            }
-        }
-        return -1; /* Limite de arquivos abertos atingido */
+        g_open_files[handle_livre].in_use = 1;
+        g_open_files[handle_livre].inode_num = rec.inodeNumber;
+        g_open_files[handle_livre].offset = 0;
+        return handle_livre;
     }
 
     /* Novo Registro: Inicia a alocação do arquivo inexistente */
@@ -723,8 +801,11 @@ SOFS_FILE sofs_open(char *name)
     unsigned int inode_to_open = rec.inodeNumber;
 
     /* Lógica de Transição Transparente para Softlinks */
-    /* Caso aberto um link simbólico, o sistema processa automaticamente a re-resolução de alvo */
-    if (rec.TypeVal == TYPEVAL_LINK) {
+    /* Substituição do if por while com limite de iterações (max 10) para evitar ciclos infinitos */
+    int num_indirections = 0;
+    while (rec.TypeVal == TYPEVAL_LINK) {
+        if (num_indirections >= 10) return -1; /* Aborta se detectado possível ciclo infinito */
+        
         struct sofs_inode link_in;
         if (read_inode(rec.inodeNumber, &link_in) != 0) return -1;
 
@@ -739,9 +820,10 @@ SOFS_FILE sofs_open(char *name)
         target_name[SOFS_MAX_FILE_NAME_SIZE] = '\0';
 
         /* Resolve o i-node definitivo apontado pela string contida no data block do softlink */
-        struct sofs_record target_rec;
-        if (find_dir_entry(target_name, &target_rec, NULL) != 0) return -1;
-        inode_to_open = target_rec.inodeNumber;
+        if (find_dir_entry(target_name, &rec, NULL) != 0) return -1;
+        inode_to_open = rec.inodeNumber;
+        
+        num_indirections++;
     }
 
     /* Indexa o arquivo na tabela isolada */
@@ -862,6 +944,12 @@ int sofs_write(SOFS_FILE handle, char *buffer, int size)
     /* Consolida expansão volumétrica caso o ponteiro desloque para o além-marcado */
     if (of->offset > in.bytesFileSize) {
         in.bytesFileSize = of->offset;
+    }
+    
+    /* Relê apenas os campos vulneráveis do i-node (como RefCounter) do disco para evitar sobrescrita por concorrência antes do salvamento final */
+    struct sofs_inode in_concorrente;
+    if (read_inode(of->inode_num, &in_concorrente) == 0) {
+        in.RefCounter = in_concorrente.RefCounter;
     }
     
     write_inode(of->inode_num, &in);
@@ -993,8 +1081,8 @@ int sofs_hln(char *linkname, char *filename)
     struct sofs_record target_rec;
     if (find_dir_entry(filename, &target_rec, NULL) != 0) return -1; 
     
-    /* Prevenção técnica contra aninhamento irrestrito de links simbólicos por hardware links */
-    if (target_rec.TypeVal == TYPEVAL_LINK) return -1; 
+    /* O sistema permite criar hardlinks apontando para softlinks validamente, seguindo o padrão UNIX */
+    /* if (target_rec.TypeVal == TYPEVAL_LINK) return -1; */ 
 
     struct sofs_record dummy;
     if (find_dir_entry(linkname, &dummy, NULL) == 0) return -1; 
